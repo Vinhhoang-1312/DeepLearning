@@ -6,7 +6,7 @@ Chạy script này 1 lần để tạo ra 3 file .ipynb:
   03_EndToEnd_Comparison.ipynb
 """
 
-import json, os
+import json, os, sys
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 
@@ -90,7 +90,7 @@ SLIDE_DIRS = [
 
 IMG_SIZE   = 80
 BATCH_SIZE = 32
-EPOCHS     = 30
+EPOCHS     = 50
 LR         = 1e-3
 MAX_SAMPLES = 5000   # tổng ảnh dùng để train (giảm nếu Colab hết RAM)
 
@@ -193,9 +193,9 @@ n_val    = int(0.15 * len(dataset))
 n_test   = len(dataset) - n_train - n_val
 train_ds, val_ds, test_ds = random_split(dataset, [n_train, n_val, n_test])
 
-train_dl = DataLoader(train_ds, BATCH_SIZE, shuffle=True,  num_workers=2, pin_memory=True)
-val_dl   = DataLoader(val_ds,   BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
-test_dl  = DataLoader(test_ds,  BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+train_dl = DataLoader(train_ds, BATCH_SIZE, shuffle=True,  num_workers=0, pin_memory=(DEVICE=="cuda"))
+val_dl   = DataLoader(val_ds,   BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=(DEVICE=="cuda"))
+test_dl  = DataLoader(test_ds,  BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=(DEVICE=="cuda"))
 print(f"Train/Val/Test: {n_train}/{n_val}/{n_test}")
 """),
 
@@ -468,6 +468,7 @@ def train_model(model, name, epochs=EPOCHS, lr=LR):
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=3, factor=0.5)
 
     early_stop_patience = 10
+    min_delta = 0.003
     epochs_no_improve = 0
 
     history = {"train_loss": [], "val_dice": [], "val_iou": []}
@@ -506,14 +507,14 @@ def train_model(model, name, epochs=EPOCHS, lr=LR):
         history["val_dice"].append(avg_dice)
         history["val_iou"].append(avg_iou)
 
-        if avg_dice > best_dice:
+        if avg_dice > best_dice + min_delta:
             best_dice  = avg_dice
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             epochs_no_improve = 0
         else:
             epochs_no_improve += 1
 
-        if epoch % 5 == 0 or epoch == 1:
+        if True:  # Log every epoch as requested
             curr_lr = optimizer.param_groups[0]['lr']
             print(f"[{name}] Epoch {epoch:3d}/{epochs} | LR {curr_lr:.1e} | "
                   f"Loss {avg_loss:.4f} | Dice {avg_dice:.4f} | IoU {avg_iou:.4f}")
@@ -684,7 +685,7 @@ DATASET_BASE = r"c:\\Users\\DELL\\Desktop\\Vinh Hoang\\Master Program\\Học sâ
 CLS_DIR       = os.path.join(DATASET_BASE, "Elsafty_RBCs_for_Classification", "Cropped images")
 IMG_SIZE      = 80
 BATCH_SIZE    = 64
-EPOCHS        = 40
+EPOCHS        = 50
 LR            = 1e-3
 SAMPLES_PER_CLASS = 1500   # set lower (e.g. 800) if RAM is limited
 
@@ -695,7 +696,26 @@ print("Config OK")
 
 code("""\
 # ── Dataset ───────────────────────────────────────────────────────────────────
-CLASSES = sorted(os.listdir(CLS_DIR))
+import zipfile
+cls_dir_path = Path(CLS_DIR)
+import zipfile, shutil
+cls_dir_path = Path(CLS_DIR)
+# 1. Tự động giải nén tất cả các file zip nếu có
+for z in cls_dir_path.glob("*.zip"):
+    print(f"Bung file nén: {z.name} ...")
+    with zipfile.ZipFile(z, 'r') as zf:
+        zf.extractall(cls_dir_path)
+
+# 2. Dọn dẹp: Xóa các thư mục rỗng hoặc không chứa ảnh (thường do zip tạo ra thư mục thừa)
+for d in list(cls_dir_path.iterdir()):
+    if d.is_dir() and not d.name.startswith('.'):
+        has_png = any(d.rglob("*.png"))
+        if not has_png:
+            print(f"🗑️ Đang xóa thư mục rỗng/thừa: {d.name}")
+            shutil.rmtree(d)
+
+# 3. CHỈ lấy những thư mục thực sự chứa ảnh .png và chuẩn hóa danh sách class
+CLASSES = sorted([d.name for d in cls_dir_path.iterdir() if d.is_dir() and any(d.glob("*.png"))])
 print(f"Classes ({len(CLASSES)}): {CLASSES}")
 CLASS2IDX = {c: i for i, c in enumerate(CLASSES)}
 
@@ -719,10 +739,15 @@ def load_samples(cls_dir, spc, classes):
     for cls in classes:
         folder = Path(cls_dir) / cls
         files  = sorted(folder.glob("*.png"))
+        if len(files) == 0:
+             print(f"⚠ Lỗi: Thư mục {cls} không có ảnh .png nào!")
+             continue
         chosen = random.sample(list(files), min(spc, len(files)))
         for f in chosen:
             samples.append((str(f), CLASS2IDX[cls]))
     random.shuffle(samples)
+    if len(samples) == 0:
+        raise ValueError("Data rỗng! Không collect được ảnh nào cho Classification.")
     return samples
 
 all_samples = load_samples(CLS_DIR, SAMPLES_PER_CLASS, CLASSES)
@@ -748,9 +773,9 @@ class_weights = {cls: 1.0 / count for cls, count in class_counts.items()}
 sample_weights = [class_weights[label] for label in train_labels]
 sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
 
-train_dl = DataLoader(train_ds, BATCH_SIZE, sampler=sampler, num_workers=2, pin_memory=True)
-val_dl   = DataLoader(val_ds,   BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
-test_dl  = DataLoader(test_ds,  BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+train_dl = DataLoader(train_ds, BATCH_SIZE, sampler=sampler, num_workers=0, pin_memory=(DEVICE=="cuda"))
+val_dl   = DataLoader(val_ds,   BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=(DEVICE=="cuda"))
+test_dl  = DataLoader(test_ds,  BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=(DEVICE=="cuda"))
 print(f"Train/Val/Test: {n_train}/{n_val}/{n_test}")
 """),
 
@@ -791,7 +816,7 @@ class CNNClassifier(nn.Module):
         x = self.layer4(x)
         return self.head(x)
 
-model_cnn = CNNClassifier().to(DEVICE)
+model_cnn = CNNClassifier(n_classes=len(CLASSES)).to(DEVICE)
 print(f"CNN params: {sum(p.numel() for p in model_cnn.parameters()):,}")
 """),
 
@@ -816,7 +841,7 @@ class BiGRUClassifier(nn.Module):
         out, _ = self.gru(x)                              # B, H, hidden*2
         return self.head(out[:, -1, :])                   # last timestep
 
-model_rnn = BiGRUClassifier().to(DEVICE)
+model_rnn = BiGRUClassifier(n_classes=len(CLASSES)).to(DEVICE)
 print(f"BiGRU params: {sum(p.numel() for p in model_rnn.parameters()):,}")
 """),
 
@@ -856,7 +881,7 @@ class ViTClassifier(nn.Module):
         x   = self.norm(self.blocks(x))
         return self.head(x[:, 0])                           # CLS token
 
-model_vit = ViTClassifier().to(DEVICE)
+model_vit = ViTClassifier(n_classes=len(CLASSES)).to(DEVICE)
 print(f"ViT params:  {sum(p.numel() for p in model_vit.parameters()):,}")
 """),
 
@@ -871,6 +896,7 @@ def train_cls(model, name, epochs=EPOCHS, lr=LR):
     crit  = nn.CrossEntropyLoss(label_smoothing=0.1)
     
     early_stop_patience = 10
+    min_delta = 0.003
     epochs_no_improve = 0
 
     best_acc, best_state = 0., None
@@ -902,14 +928,14 @@ def train_cls(model, name, epochs=EPOCHS, lr=LR):
         history["train_loss"].append(running / len(train_dl))
         history["val_acc"].append(acc)
 
-        if acc > best_acc:
+        if acc > best_acc + min_delta:
             best_acc  = acc
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             epochs_no_improve = 0
         else:
             epochs_no_improve += 1
 
-        if epoch % 5 == 0 or epoch == 1:
+        if True:  # Log every epoch as requested
             curr_lr = opt.param_groups[0]['lr']
             print(f"[{name}] Epoch {epoch:3d}/{epochs} | LR {curr_lr:.1e} | "
                   f"Loss {running/len(train_dl):.4f} | Val Acc {acc:.4f}")
@@ -1016,10 +1042,12 @@ DATASET_BASE = r"c:\\Users\\DELL\\Desktop\\Vinh Hoang\\Master Program\\Học sâ
 
 SEG_RESULTS = os.path.join(os.path.dirname(DATASET_BASE), "results", "segmentation")
 CLS_RESULTS = os.path.join(os.path.dirname(DATASET_BASE), "results", "classification")
-CLASSES = sorted(os.listdir(os.path.join(DATASET_BASE, "Elsafty_RBCs_for_Classification", "Cropped images")))
+cls_dir     = os.path.join(DATASET_BASE, "Elsafty_RBCs_for_Classification", "Cropped images")
+# CHỈ lấy những thư mục thực sự chứa ảnh .png (giống như Notebook 2 đã làm)
+CLASSES = sorted([d.name for d in Path(cls_dir).iterdir() if d.is_dir() and any(d.glob("*.png"))])
 IMG_SIZE = 80
 print(f"Device: {DEVICE}")
-print(f"Classes: {CLASSES}")
+print(f"Classes ({len(CLASSES)}): {CLASSES}")
 """),
 
 code("""\
@@ -1190,10 +1218,31 @@ print(df.to_string(index=False))
 ]
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GENERATE ALL NOTEBOOKS
+# SMART GENERATE NOTEBOOKS
 # ══════════════════════════════════════════════════════════════════════════════
 
-save(notebook(SEG_CELLS), "01_Segmentation_Comparison.ipynb")
-save(notebook(CLS_CELLS), "02_Classification_Comparison.ipynb")
-save(notebook(E2E_CELLS), "03_EndToEnd_Comparison.ipynb")
-print("\\n🎉 All notebooks generated! Open them in VS Code with your Colab runtime.")
+targets = {
+    "1": ("01_Segmentation_Comparison.ipynb", SEG_CELLS),
+    "2": ("02_Classification_Comparison.ipynb", CLS_CELLS),
+    "3": ("03_EndToEnd_Comparison.ipynb", E2E_CELLS),
+}
+
+requested = [arg for arg in sys.argv[1:] if arg in targets]
+
+if not requested:
+    print("\n🧐 Không có tham số chọn lọc. Đang kiểm tra để sinh tất cả các Notebook...")
+    for key, (filename, cells) in targets.items():
+        if os.path.exists(filename):
+            print(f"⚠️  Bỏ qua {filename}: File đã tồn tại (để bảo vệ log training).")
+            print(f"   Dùng 'python generate_notebooks.py {key}' nếu bạn muốn ghi đè file này.")
+        else:
+            save(notebook(cells), filename)
+            print(f"✅  Created: {filename}")
+else:
+    print(f"\n🚀 Đang sinh các Notebook được yêu cầu: {requested}")
+    for key in requested:
+        filename, cells = targets[key]
+        save(notebook(cells), filename)
+        print(f"✅  Updated (Forced): {filename}")
+
+print("\n🎉 Xong! Hãy mở các file trên trong VS Code.")
