@@ -250,7 +250,8 @@ class SwinClassifier(nn.Module):
                  embed_dim=64, depths=(2,2,2), num_heads=(4,8,16),
                  window_size=5, mlp_ratio=4.0, dropout=0.1):
         super().__init__()
-        self.pe = nn.Conv2d(in_ch, embed_dim, patch_size, patch_size)
+        self.patch_embed = nn.Module()
+        self.patch_embed.proj = nn.Conv2d(in_ch, embed_dim, patch_size, patch_size)
         self.pn = nn.LayerNorm(embed_dim)
         self.pd = nn.Dropout(dropout)
         res = img_size // patch_size
@@ -269,9 +270,110 @@ class SwinClassifier(nn.Module):
         self.head = nn.Sequential(nn.Dropout(0.4), nn.Linear(dim, n_classes))
 
     def forward(self, x):
-        B=x.shape[0]; x=self.pe(x); C,H,W=x.shape[1],x.shape[2],x.shape[3]
+        B=x.shape[0]; x=self.patch_embed.proj(x); C,H,W=x.shape[1],x.shape[2],x.shape[3]
         x=self.pd(self.pn(x.flatten(2).transpose(1,2)))
         for blocks, ds in self.stages:
             for blk in blocks: x=blk(x)
             if not isinstance(ds, nn.Identity): x=ds(x)
         return self.head(self.pool(self.norm(x).transpose(1,2)).squeeze(-1))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Segmentation Architectures (Notebook 01 & 04)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ConvLSTMCell(nn.Module):
+    def __init__(self, in_ch, hidden_ch, kernel_size=3):
+        super().__init__()
+        self.hidden_ch = hidden_ch
+        pad = kernel_size // 2
+        self.gates = nn.Conv2d(in_ch + hidden_ch, 4 * hidden_ch, kernel_size, padding=pad)
+    def forward(self, x, h, c):
+        combined = torch.cat([x, h], dim=1)
+        i, f, g, o = self.gates(combined).chunk(4, dim=1)
+        i, f, o = torch.sigmoid(i), torch.sigmoid(f), torch.sigmoid(o)
+        g = torch.tanh(g)
+        c = f * c + i * g
+        h = o * torch.tanh(c)
+        return h, c
+    def init_hidden(self, B, H, W, device):
+        return (torch.zeros(B, self.hidden_ch, H, W, device=device),
+                torch.zeros(B, self.hidden_ch, H, W, device=device))
+
+class ConvLSTMUNet(nn.Module):
+    def __init__(self, in_ch=3, out_ch=1, features=[16, 32, 64]):
+        super().__init__()
+        self.encoders, self.pools = nn.ModuleList(), nn.ModuleList()
+        self.decoders, self.upconvs = nn.ModuleList(), nn.ModuleList()
+        prev = in_ch
+        for f in features:
+            self.encoders.append(DoubleConv(prev, f))
+            self.pools.append(nn.MaxPool2d(2)); prev = f
+        bn_ch = prev * 2
+        self.bn_conv = nn.Conv2d(prev, bn_ch, 1)
+        self.conv_lstm = ConvLSTMCell(bn_ch, bn_ch)
+        prev = bn_ch
+        for f in reversed(features):
+            self.upconvs.append(nn.ConvTranspose2d(prev, f, 2, 2))
+            self.decoders.append(DoubleConv(f * 2, f)); prev = f
+        self.head = nn.Conv2d(prev, out_ch, 1)
+    def forward(self, x):
+        skips = []
+        for enc, pool in zip(self.encoders, self.pools):
+            x = enc(x); skips.append(x); x = pool(x)
+        x = self.bn_conv(x); B, C, H, W = x.shape
+        h, c = self.conv_lstm.init_hidden(B, H, W, x.device)
+        for t in range(H):
+            row = x[:, :, t:t+1, :].expand(-1, -1, H, W)
+            h, c = self.conv_lstm(row, h, c)
+        x = h; skips = skips[::-1]
+        for up, dec, skip in zip(self.upconvs, self.decoders, skips):
+            x = up(x)
+            if x.shape != skip.shape: x = F.interpolate(x, size=skip.shape[2:])
+            x = dec(torch.cat([skip, x], dim=1))
+        return self.head(x)
+
+class ViTUNet(nn.Module):
+    def __init__(self, img_size=80, patch_size=8, in_ch=3, out_ch=1, embed_dim=64, depth=4, heads=4):
+        super().__init__()
+        self.patch = nn.Module(); self.patch.proj = nn.Conv2d(in_ch, embed_dim, patch_size, patch_size)
+        self.n = (img_size // patch_size) ** 2
+        self.pos_embed = nn.Parameter(torch.randn(1, self.n, embed_dim) * 0.02)
+        self.blocks = nn.Sequential(*[TransBlock(embed_dim, heads) for _ in range(depth)])
+        self.norm = nn.LayerNorm(embed_dim)
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(embed_dim, 64, 2, 2), nn.ReLU(), nn.BatchNorm2d(64),
+            nn.ConvTranspose2d(64, 32, 2, 2), nn.ReLU(), nn.BatchNorm2d(32),
+            nn.ConvTranspose2d(32, 16, 2, 2), nn.ReLU(), nn.BatchNorm2d(16),
+            nn.Conv2d(16, out_ch, 1))
+    def forward(self, x):
+        B = x.shape[0]; x = self.patch.proj(x); H, W = x.shape[2:]
+        tokens = x.flatten(2).transpose(1, 2)
+        if tokens.shape[1] != self.pos_embed.shape[1]:
+            side = int(self.pos_embed.shape[1]**0.5)
+            pe = self.pos_embed.reshape(1, side, side, -1).permute(0, 3, 1, 2)
+            pe = F.interpolate(pe, size=(H, W), mode='bicubic', align_corners=False)
+            tokens = tokens + pe.flatten(2).transpose(1, 2)
+        else: tokens = tokens + self.pos_embed
+        x = self.norm(self.blocks(tokens)).transpose(1, 2).reshape(B, -1, H, W)
+        return self.decoder(x)
+
+class SwinUNet(nn.Module):
+    def __init__(self, img_size=80, patch_size=4, in_ch=3, out_ch=1, embed_dim=64, depth=2, heads=4, window_size=5):
+        super().__init__()
+        self.patch = nn.Module(); self.patch.proj = nn.Conv2d(in_ch, embed_dim, patch_size, patch_size)
+        res = img_size // patch_size
+        self.blocks = nn.ModuleList([_SwinBlock(embed_dim, heads, window_size, shift=(j%2==1), resolution=(res,res)) for j in range(depth)])
+        self.norm = nn.LayerNorm(embed_dim)
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(embed_dim, 32, 2, 2), nn.ReLU(), nn.BatchNorm2d(32),
+            nn.ConvTranspose2d(32, 16, 2, 2), nn.ReLU(), nn.BatchNorm2d(16),
+            nn.Conv2d(16, out_ch, 1))
+    def forward(self, x):
+        B = x.shape[0]; x = self.patch.proj(x); H, W = x.shape[2:]
+        tokens = x.flatten(2).transpose(1, 2)
+        # For simplicity in Swin, we don't have pos_embed to interpolate,
+        # but the window attention masks in _SwinBlock depend on resolution.
+        # Here we just pass tokens through. Note: Shifted windows might be slightly off if H/W != 20.
+        for blk in self.blocks: x = blk(tokens)
+        x = self.norm(x).transpose(1, 2).reshape(B, -1, H, W)
+        return self.decoder(x)
