@@ -175,15 +175,15 @@ class _WindowAttn(nn.Module):
         super().__init__()
         self.ws = window_size; self.nh = num_heads
         self.scale = (dim // num_heads) ** -0.5
-        self.rpb = nn.Parameter(torch.zeros((2*window_size-1)**2, num_heads))
-        nn.init.trunc_normal_(self.rpb, std=0.02)
+        self.relative_position_bias_table = nn.Parameter(torch.zeros((2*window_size-1)**2, num_heads))
+        nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
         coords = torch.stack(torch.meshgrid(torch.arange(window_size), torch.arange(window_size)))  # 'ij' is default
         cf = torch.flatten(coords, 1)
         rc = cf[:,:,None] - cf[:,None,:]
         rc = rc.permute(1,2,0).contiguous()
         rc[:,:,0] += window_size-1; rc[:,:,1] += window_size-1
         rc[:,:,0] *= 2*window_size-1
-        self.register_buffer("rpi", rc.sum(-1))
+        self.register_buffer("relative_position_index", rc.sum(-1))
         self.qkv = nn.Linear(dim, dim*3); self.proj = nn.Linear(dim, dim)
         self.drop = nn.Dropout(dropout)
 
@@ -192,7 +192,7 @@ class _WindowAttn(nn.Module):
         qkv = self.qkv(x).reshape(B_, N,3,self.nh,C//self.nh).permute(2,0,3,1,4)
         q,k,v = qkv.unbind(0)
         attn = (q*self.scale) @ k.transpose(-2,-1)
-        bias = self.rpb[self.rpi.view(-1)].view(self.ws**2,self.ws**2,-1).permute(2,0,1).unsqueeze(0)
+        bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(self.ws**2,self.ws**2,-1).permute(2,0,1).unsqueeze(0)
         attn = attn + bias
         if mask is not None:
             nW = mask.shape[0]
@@ -206,7 +206,7 @@ class _SwinBlock(nn.Module):
         super().__init__()
         self.ws = window_size; self.ss = window_size//2 if shift else 0
         self.res = resolution
-        self.n1 = nn.LayerNorm(dim); self.n2 = nn.LayerNorm(dim)
+        self.norm1 = nn.LayerNorm(dim); self.norm2 = nn.LayerNorm(dim)
         self.attn = _WindowAttn(dim, window_size, num_heads, dropout)
         self.mlp  = nn.Sequential(nn.Linear(dim, int(dim*mlp_ratio)), nn.GELU(),
                                    nn.Dropout(dropout), nn.Linear(int(dim*mlp_ratio), dim), nn.Dropout(dropout))
@@ -222,60 +222,64 @@ class _SwinBlock(nn.Module):
             am = am.masked_fill(am!=0,-100.).masked_fill(am==0,0.)
         else:
             am=None
-        self.register_buffer("am", am)
+        self.register_buffer("attn_mask", am)
 
     def forward(self, x):
         H,W = self.res; B,L,C = x.shape; res=x
-        x = self.n1(x).view(B,H,W,C)
+        x = self.norm1(x).view(B,H,W,C)
         if self.ss>0: x=torch.roll(x,(-self.ss,-self.ss),(1,2))
         xw = _window_partition(x,self.ws).view(-1,self.ws**2,C)
-        xw = self.attn(xw, self.am)
+        xw = self.attn(xw, self.attn_mask)
         x = _window_reverse(xw.view(-1,self.ws,self.ws,C),self.ws,H,W)
         if self.ss>0: x=torch.roll(x,(self.ss,self.ss),(1,2))
         x=x.view(B,H*W,C)+res
-        return x+self.mlp(self.n2(x))
+        return x+self.mlp(self.norm2(x))
 
 class _PatchMerging(nn.Module):
     def __init__(self, dim, res):
         super().__init__()
-        self.res=res; self.norm=nn.LayerNorm(4*dim); self.red=nn.Linear(4*dim,2*dim,bias=False)
-    def forward(self,x):
-        H,W=self.res; B,L,C=x.shape; x=x.view(B,H,W,C)
-        x=torch.cat([x[:,0::2,0::2],x[:,1::2,0::2],x[:,0::2,1::2],x[:,1::2,1::2]],-1).view(B,-1,4*C)
-        return self.red(self.norm(x))
+        self.res = res
+        self.norm = nn.LayerNorm(4 * dim)
+        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
+    def forward(self, x):
+        H, W = self.res; B, L, C = x.shape; x = x.view(B, H, W, C)
+        x = torch.cat([x[:, 0::2, 0::2], x[:, 1::2, 0::2], x[:, 0::2, 1::2], x[:, 1::2, 1::2]], -1).view(B, -1, 4 * C)
+        return self.reduction(self.norm(x))
 
 class SwinClassifier(nn.Module):
-    """Swin Transformer for 80x80 RBC images, 9 classes."""
     def __init__(self, img_size=80, patch_size=4, in_ch=3, n_classes=9,
-                 embed_dim=64, depths=(2,2,2), num_heads=(4,8,16),
+                 embed_dim=64, depths=(2, 2, 2), num_heads=(4, 8, 16),
                  window_size=5, mlp_ratio=4.0, dropout=0.1):
         super().__init__()
-        self.patch_embed = nn.Module()
-        self.patch_embed.proj = nn.Conv2d(in_ch, embed_dim, patch_size, patch_size)
-        self.pn = nn.LayerNorm(embed_dim)
-        self.pd = nn.Dropout(dropout)
-        res = img_size // patch_size
-        self.stages = nn.ModuleList()
-        dim = embed_dim
-        for i, depth in enumerate(depths):
-            blocks = nn.ModuleList([_SwinBlock(dim, num_heads[i], window_size,
-                                               shift=(j%2==1), mlp_ratio=mlp_ratio,
-                                               dropout=dropout, resolution=(res,res))
-                                    for j in range(depth)])
-            ds = _PatchMerging(dim,(res,res)) if i<len(depths)-1 else None
-            self.stages.append(nn.ModuleList([blocks, ds or nn.Identity()]))
-            if i<len(depths)-1: dim*=2; res//=2
-        self.norm = nn.LayerNorm(dim)
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.head = nn.Sequential(nn.Dropout(0.4), nn.Linear(dim, n_classes))
+        self.patch_embed = nn.Module(); self.patch_embed.proj = nn.Conv2d(in_ch, embed_dim, patch_size, patch_size)
+        self.patch_norm = nn.LayerNorm(embed_dim)
+        
+        self.layers = nn.ModuleList()
+        curr_res = img_size // patch_size
+        for i in range(len(depths)):
+            layer = nn.Module()
+            layer.blocks = nn.ModuleList([
+                _SwinBlock(embed_dim, num_heads[i], window_size, shift=(j % 2 == 1),
+                           mlp_ratio=mlp_ratio, dropout=dropout, resolution=(curr_res, curr_res))
+                for j in range(depths[i])
+            ])
+            if i < len(depths) - 1:
+                layer.downsample = _PatchMerging(embed_dim, (curr_res, curr_res))
+                curr_res //= 2; embed_dim *= 2
+            else:
+                layer.downsample = None
+            self.layers.append(layer)
+
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, n_classes)
 
     def forward(self, x):
-        B=x.shape[0]; x=self.patch_embed.proj(x); C,H,W=x.shape[1],x.shape[2],x.shape[3]
-        x=self.pd(self.pn(x.flatten(2).transpose(1,2)))
-        for blocks, ds in self.stages:
-            for blk in blocks: x=blk(x)
-            if not isinstance(ds, nn.Identity): x=ds(x)
-        return self.head(self.pool(self.norm(x).transpose(1,2)).squeeze(-1))
+        B = x.shape[0]; x = self.patch_embed.proj(x).permute(0, 2, 3, 1).contiguous()
+        x = self.patch_norm(x).flatten(1, 2)
+        for layer in self.layers:
+            for blk in layer.blocks: x = blk(x)
+            if layer.downsample is not None: x = layer.downsample(x)
+        return self.head(self.norm(x.mean(1)))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Segmentation Architectures (Notebook 01 & 04)
@@ -374,6 +378,6 @@ class SwinUNet(nn.Module):
         # For simplicity in Swin, we don't have pos_embed to interpolate,
         # but the window attention masks in _SwinBlock depend on resolution.
         # Here we just pass tokens through. Note: Shifted windows might be slightly off if H/W != 20.
-        for blk in self.blocks: x = blk(tokens)
-        x = self.norm(x).transpose(1, 2).reshape(B, -1, H, W)
+        for blk in self.blocks: tokens = blk(tokens)
+        x = self.norm(tokens).transpose(1, 2).reshape(B, -1, H, W)
         return self.decoder(x)
